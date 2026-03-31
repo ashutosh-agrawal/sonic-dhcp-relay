@@ -1,6 +1,7 @@
 #include "dhcp4relay_mgr.h"
 
 #include <algorithm>
+#include <mutex>
 #include <sstream>
 constexpr auto DEFAULT_TIMEOUT_MSEC = 1000;
 
@@ -11,8 +12,11 @@ using namespace swss;
 #endif
 
 metadata_config m_config;
+/* Protects m_config and global_dhcp_server_ip which are written by the listener
+   thread and read by the main event-loop thread. */
+std::mutex g_shared_config_mutex;
 
-bool feature_dhcp_server_enabled = false;
+std::atomic<bool> feature_dhcp_server_enabled{false};
 std::shared_ptr<swss::SubscriberStateTable> config_db_dhcp_server_ipv4_ptr = NULL;
 std::shared_ptr<swss::SubscriberStateTable> state_db_dhcp_server_ipv4_ip_ptr = NULL;
 std::shared_ptr<swss::SubscriberStateTable> config_db_relaymgr_table_ptr = NULL;
@@ -26,7 +30,7 @@ std::string global_dhcp_server_ip;
  *
  * @note The spawned thread is detached, so it will run independently of the main thread.
  */
-void DHCPMgr::initialize_config_listner() {
+void DHCPMgr::initialize_config_listener() {
     stop_thread = false;
     std::thread m_swss_thread(&DHCPMgr::handle_swss_notification, this);
     m_swss_thread.detach();
@@ -165,23 +169,36 @@ void DHCPMgr::process_device_metadata_notification(std::deque<swss::KeyOpFieldsV
         bool send_dualTor_event = false;
         std::string subtype_value;
 
-        for (auto &field : field_values) {
-            std::string f = fvField(field);
-            std::string v = fvValue(field);
+        {
+            std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+            for (auto &field : field_values) {
+                std::string f = fvField(field);
+                std::string v = fvValue(field);
 
-            if (f == "hostname") {
-		m_config.hostname = v;
-            } else if (f == "mac") {
-                std::transform(v.begin(), v.end(), v.begin(), ::tolower);
-		m_config.host_mac_addr = v;
-            } else if (f == "deployment_id") {
-		m_config.deployment_id = static_cast<uint32_t>(std::stoul(v));
-            } else if (f == "subtype") {
-                subtype_found = true;
-                subtype_value = v;
+                if (f == "hostname") {
+                    m_config.hostname = v;
+                } else if (f == "mac") {
+                    std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+                    m_config.host_mac_addr = v;
+                } else if (f == "deployment_id") {
+                    try {
+                        m_config.deployment_id = static_cast<uint32_t>(std::stoul(v));
+                    } catch (const std::exception &e) {
+                        syslog(LOG_WARNING, "[DHCPV4_RELAY] Invalid deployment_id '%s': %s, ignoring",
+                               v.c_str(), e.what());
+                    }
+                } else if (f == "subtype") {
+                    subtype_found = true;
+                    subtype_value = v;
+                }
             }
 
-            // Handle is_dualToR logic
+            /* Re-set hostname to default value if hostname is deleted */
+            if (m_config.hostname.length() == 0) {
+                m_config.hostname = "sonic";
+            }
+
+            // Handle is_dualToR logic once per entry, after all fields are parsed
             if (subtype_found && subtype_value == "DualToR") {
                 m_config.is_dualTor = true;
                 send_dualTor_event = true;
@@ -190,35 +207,26 @@ void DHCPMgr::process_device_metadata_notification(std::deque<swss::KeyOpFieldsV
                 m_config.is_dualTor = false;
                 send_dualTor_event = true;
             }
-
-            if (send_dualTor_event) {
-                relay_config *relay_msg = nullptr;
-                try {
-                    relay_msg = new relay_config();
-                } catch (const std::bad_alloc &e) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Memory allocation failed: %s", e.what());
-                    return;
-                }
-
-                if (m_config.is_dualTor) {
-                   relay_msg->is_add = true;
-                } else {
-                   relay_msg->is_add = false;
-                }
-
-                event_config event;
-                event.type = DHCPv4_RELAY_DUAL_TOR_UPDATE;
-                event.msg = static_cast<void *>(relay_msg);
-                // Write the pointer address to the pipe
-                if (write(config_pipe[1], &event, sizeof(event)) == -1) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to write to config update pipe: %s", strerror(errno));
-                    delete relay_msg;
-                }
-	    }
         }
-        /* Re-set hostname to default value if hostname is deleted */
-	if (m_config.hostname.length() == 0) {
-            m_config.hostname = "sonic";
+
+        if (send_dualTor_event) {
+            relay_config *relay_msg = nullptr;
+            try {
+                relay_msg = new relay_config();
+            } catch (const std::bad_alloc &e) {
+                syslog(LOG_ERR, "[DHCPV4_RELAY] Memory allocation failed: %s", e.what());
+                return;
+            }
+
+            relay_msg->is_add = m_config.is_dualTor;
+
+            event_config event;
+            event.type = DHCPv4_RELAY_DUAL_TOR_UPDATE;
+            event.msg = static_cast<void *>(relay_msg);
+            if (write(config_pipe[1], &event, sizeof(event)) == -1) {
+                syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to write to config update pipe: %s", strerror(errno));
+                delete relay_msg;
+            }
         }
     }
 }
@@ -348,7 +356,12 @@ void DHCPMgr::process_relay_notification(std::deque<swss::KeyOpFieldsValuesTuple
                 } else if (f == "agent_relay_mode") {
                     relay_msg->agent_relay_mode = v;
                 } else if (f == "max_hop_count") {
-                    relay_msg->max_hop_count = static_cast<uint8_t>(std::stoi(v));
+                    try {
+                        relay_msg->max_hop_count = static_cast<uint8_t>(std::stoi(v));
+                    } catch (const std::exception &e) {
+                        syslog(LOG_WARNING, "[DHCPV4_RELAY] Invalid max_hop_count '%s': %s, using default",
+                               v.c_str(), e.what());
+                    }
                 }
                 syslog(LOG_DEBUG, "[DHCPV4_RELAY] key: %s, Operation: %s, f: %s, v: %s", vlan.c_str(), operation.c_str(), f.c_str(), v.c_str());
             }
@@ -377,6 +390,7 @@ void DHCPMgr::process_relay_notification(std::deque<swss::KeyOpFieldsValuesTuple
 
         if (relay_msg->servers.empty() && operation != "DEL") {
             syslog(LOG_WARNING, "[DHCPV4_RELAY] No servers found for VLAN %s, skipping configuration.", vlan.c_str());
+            delete relay_msg;
             continue;
         }
         syslog(LOG_INFO, "[DHCPV4_RELAY] %s %s relay config\n", operation.c_str(), vlan.c_str());
@@ -515,17 +529,19 @@ void DHCPMgr::process_dhcp_server_ipv4_ip_notification(std::deque<swss::KeyOpFie
 		  return;
             }
 	    //modification case
-            if (!global_dhcp_server_ip.empty() && (global_dhcp_server_ip != server_ip)) {
-		event_config event;
-                event.type = DHCPv4_SERVER_IP_UPDATE;
-
-		if (write(config_pipe[1], &event, sizeof(event)) == -1) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to send delete event for dhcp_server IP update");
-		    return;
+            {
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                if (!global_dhcp_server_ip.empty() && (global_dhcp_server_ip != server_ip)) {
+                    event_config event;
+                    event.type = DHCPv4_SERVER_IP_UPDATE;
+                    if (write(config_pipe[1], &event, sizeof(event)) == -1) {
+                        syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to send delete event for dhcp_server IP update");
+                        return;
+                    }
+                    is_modify = true;
                 }
-		is_modify = true;
-	    }
-	    global_dhcp_server_ip = server_ip;
+                global_dhcp_server_ip = server_ip;
+            }
 	    //Since the server IP see newly added, restart the listener for the dhcp_server config.
 	    if (!is_modify) {
 	       syslog(LOG_INFO, "[DHCPV4_RELAY] Restarting the dhcp_server listener");
