@@ -1,6 +1,8 @@
 #include "dhcp4relay_mgr.h"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <sstream>
 constexpr auto DEFAULT_TIMEOUT_MSEC = 1000;
 
@@ -11,8 +13,9 @@ using namespace swss;
 #endif
 
 metadata_config m_config;
+std::mutex g_shared_config_mutex;
 
-bool feature_dhcp_server_enabled = false;
+std::atomic<bool> feature_dhcp_server_enabled{false};
 std::shared_ptr<swss::SubscriberStateTable> config_db_dhcp_server_ipv4_ptr = NULL;
 std::shared_ptr<swss::SubscriberStateTable> state_db_dhcp_server_ipv4_ip_ptr = NULL;
 std::shared_ptr<swss::SubscriberStateTable> config_db_relaymgr_table_ptr = NULL;
@@ -169,7 +172,6 @@ void DHCPMgr::process_device_metadata_notification(std::deque<swss::KeyOpFieldsV
             continue;
         }
         bool subtype_found = false;
-        bool send_dualTor_event = false;
         std::string subtype_value;
 
         for (auto &field : field_values) {
@@ -177,69 +179,84 @@ void DHCPMgr::process_device_metadata_notification(std::deque<swss::KeyOpFieldsV
             std::string v = fvValue(field);
 
             if (f == "hostname") {
-		m_config.hostname = v;
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                m_config.hostname = v;
             } else if (f == "mac") {
                 std::transform(v.begin(), v.end(), v.begin(), ::tolower);
-		m_config.host_mac_addr = v;
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                m_config.host_mac_addr = v;
             } else if (f == "deployment_id") {
-		m_config.deployment_id = static_cast<uint32_t>(std::stoul(v));
+                try {
+                    std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                    m_config.deployment_id = static_cast<uint32_t>(std::stoul(v));
+                } catch (const std::exception &e) {
+                    syslog(LOG_WARNING, "[DHCPV4_RELAY] Invalid deployment_id '%s': %s", v.c_str(), e.what());
+                }
             } else if (f == "subtype") {
                 subtype_found = true;
                 subtype_value = v;
             }
+        }
 
-            // Handle is_dualToR logic
+        /* Re-set hostname to default value if hostname is deleted */
+        {
+            std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+            if (m_config.hostname.empty()) {
+                m_config.hostname = "sonic";
+            }
+        }
+
+        /* Update DualTor and SmartSwitch flags once after all fields are processed */
+        bool prev_dualTor;
+        bool prev_SmartSwitch;
+        {
+            std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+            prev_dualTor     = m_config.is_dualTor;
+            prev_SmartSwitch = m_config.is_SmartSwitch;
+
             if (subtype_found && subtype_value == "DualToR") {
                 m_config.is_dualTor = true;
-                send_dualTor_event = true;
-            } else if (m_config.is_dualTor) {
-                // Covers both 'subtype' deleted and any value other than "DualToR"
+            } else {
                 m_config.is_dualTor = false;
-                send_dualTor_event = true;
             }
 
-            // Handle is_SmartSwitch logic
             if (subtype_found && subtype_value == "SmartSwitch") {
                 m_config.is_SmartSwitch = true;
                 std::string bridge_name;
-                bool ok = midplane_tbl.hget("GLOBAL", "bridge", bridge_name);
-                if (ok) {
+                if (midplane_tbl.hget("GLOBAL", "bridge", bridge_name)) {
                     m_config.midplane_bridge = bridge_name;
                 } else {
                     syslog(LOG_ERR, "Failed to read midplane bridge name\n");
                 }
-            } else if (m_config.is_SmartSwitch) {
+            } else {
                 m_config.is_SmartSwitch = false;
             }
-
-            if (send_dualTor_event) {
-                relay_config *relay_msg = nullptr;
-                try {
-                    relay_msg = new relay_config();
-                } catch (const std::bad_alloc &e) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Memory allocation failed: %s", e.what());
-                    return;
-                }
-
-                if (m_config.is_dualTor) {
-                   relay_msg->is_add = true;
-                } else {
-                   relay_msg->is_add = false;
-                }
-
-                event_config event;
-                event.type = DHCPv4_RELAY_DUAL_TOR_UPDATE;
-                event.msg = static_cast<void *>(relay_msg);
-                // Write the pointer address to the pipe
-                if (write(config_pipe[1], &event, sizeof(event)) == -1) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to write to config update pipe: %s", strerror(errno));
-                    delete relay_msg;
-                }
-	    }
         }
-        /* Re-set hostname to default value if hostname is deleted */
-	if (m_config.hostname.length() == 0) {
-            m_config.hostname = "sonic";
+
+        bool new_dualTor;
+        {
+            std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+            new_dualTor = m_config.is_dualTor;
+        }
+
+        if (prev_dualTor != new_dualTor) {
+            relay_config *relay_msg = nullptr;
+            try {
+                relay_msg = new relay_config();
+            } catch (const std::bad_alloc &e) {
+                syslog(LOG_ERR, "[DHCPV4_RELAY] Memory allocation failed: %s", e.what());
+                return;
+            }
+
+            relay_msg->is_add = new_dualTor;
+
+            event_config event;
+            event.type = DHCPv4_RELAY_DUAL_TOR_UPDATE;
+            event.msg = static_cast<void *>(relay_msg);
+            if (write(config_pipe[1], &event, sizeof(event)) == -1) {
+                syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to write to config update pipe: %s", strerror(errno));
+                delete relay_msg;
+            }
         }
     }
 }
@@ -369,7 +386,11 @@ void DHCPMgr::process_relay_notification(std::deque<swss::KeyOpFieldsValuesTuple
                 } else if (f == "agent_relay_mode") {
                     relay_msg->agent_relay_mode = v;
                 } else if (f == "max_hop_count") {
-                    relay_msg->max_hop_count = static_cast<uint8_t>(std::stoi(v));
+                    try {
+                        relay_msg->max_hop_count = static_cast<uint8_t>(std::stoi(v));
+                    } catch (const std::exception &e) {
+                        syslog(LOG_WARNING, "[DHCPV4_RELAY] Invalid max_hop_count '%s': %s", v.c_str(), e.what());
+                    }
                 }
                 syslog(LOG_DEBUG, "[DHCPV4_RELAY] key: %s, Operation: %s, f: %s, v: %s", vlan.c_str(), operation.c_str(), f.c_str(), v.c_str());
             }
@@ -398,6 +419,7 @@ void DHCPMgr::process_relay_notification(std::deque<swss::KeyOpFieldsValuesTuple
 
         if (relay_msg->servers.empty() && operation != "DEL") {
             syslog(LOG_WARNING, "[DHCPV4_RELAY] No servers found for VLAN %s, skipping configuration.", vlan.c_str());
+            delete relay_msg;
             continue;
         }
         syslog(LOG_INFO, "[DHCPV4_RELAY] %s %s relay config\n", operation.c_str(), vlan.c_str());
@@ -474,7 +496,10 @@ void DHCPMgr::process_feature_notification(std::deque<swss::KeyOpFieldsValuesTup
         } else if (state == "disabled" && feature_dhcp_server_enabled) {
             syslog(LOG_INFO, "[DHCPV4_RELAY] Disabling DHCP server auto-config mode and cleaning up.");
             feature_dhcp_server_enabled = false;
-            global_dhcp_server_ip.clear();
+            {
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                global_dhcp_server_ip.clear();
+            }
 	    vlans_copy.clear();
 	    //Delete the old auto generated relay config in main thread
 	    event_config event;
@@ -536,17 +561,19 @@ void DHCPMgr::process_dhcp_server_ipv4_ip_notification(std::deque<swss::KeyOpFie
 		  return;
             }
 	    //modification case
-            if (!global_dhcp_server_ip.empty() && (global_dhcp_server_ip != server_ip)) {
-		event_config event;
-                event.type = DHCPv4_SERVER_IP_UPDATE;
-
-		if (write(config_pipe[1], &event, sizeof(event)) == -1) {
-                    syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to send delete event for dhcp_server IP update");
-		    return;
+            {
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                if (!global_dhcp_server_ip.empty() && (global_dhcp_server_ip != server_ip)) {
+                    event_config event;
+                    event.type = DHCPv4_SERVER_IP_UPDATE;
+                    if (write(config_pipe[1], &event, sizeof(event)) == -1) {
+                        syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to send delete event for dhcp_server IP update");
+                        return;
+                    }
+                    is_modify = true;
                 }
-		is_modify = true;
-	    }
-	    global_dhcp_server_ip = server_ip;
+                global_dhcp_server_ip = server_ip;
+            }
 	    //Since the server IP see newly added, restart the listener for the dhcp_server config.
 	    if (!is_modify) {
 	       syslog(LOG_INFO, "[DHCPV4_RELAY] Restarting the dhcp_server listener");
@@ -563,9 +590,12 @@ void DHCPMgr::process_dhcp_server_ipv4_ip_notification(std::deque<swss::KeyOpFie
 
             if (write(config_pipe[1], &event, sizeof(event)) == -1) {
                 syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to send delete event for dhcp_server IP delete");
-		return;
+                return;
             }
-	    global_dhcp_server_ip.clear();
+            {
+                std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                global_dhcp_server_ip.clear();
+            }
 	    vlans_copy.clear();
 	}
     }
@@ -713,14 +743,23 @@ void DHCPMgr::process_dhcp_server_ipv4_notification(std::deque<swss::KeyOpFields
             }
 
             if (state == "enabled") {
-              if (global_dhcp_server_ip.empty()) {
+              std::string current_server_ip;
+              {
+                  std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                  current_server_ip = global_dhcp_server_ip;
+              }
+              if (current_server_ip.empty()) {
                   std::shared_ptr<swss::DBConnector> state_db_ptr = std::make_shared<swss::DBConnector>("STATE_DB", 0);
                   swss::Table ip_tbl(state_db_ptr.get(), "DHCP_SERVER_IPV4_SERVER_IP");
 
                   std::string ip;
                   ip_tbl.hget("eth0", "ip", ip);
                   if (!ip.empty()) {
-                     global_dhcp_server_ip = ip;
+                     {
+                         std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                         global_dhcp_server_ip = ip;
+                     }
+                     current_server_ip = ip;
                      syslog(LOG_INFO, "[DHCPV4_RELAY] Fetched DHCPv4 server IP from STATE_DB: %s", ip.c_str());
                   } else {
                      syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to get DHCPv4 server IP from STATE_DB");
@@ -728,7 +767,7 @@ void DHCPMgr::process_dhcp_server_ipv4_notification(std::deque<swss::KeyOpFields
                   }
               }
               relay_msg->is_add = true;
-              relay_msg->servers.push_back(global_dhcp_server_ip);
+              relay_msg->servers.push_back(current_server_ip);
               relay_msg->vrf = "default";
             } else if (state == "disabled") {
 		relay_msg->is_add = false; //In case of modify in state field need to delete the entry
