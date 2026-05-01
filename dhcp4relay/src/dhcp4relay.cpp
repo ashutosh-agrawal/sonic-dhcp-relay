@@ -1,8 +1,10 @@
+#include <atomic>
 #include <errno.h>
 #include <event.h>
 #include <event2/bufferevent.h>
 #include <event2/event.h>
 #include <fcntl.h>
+#include <mutex>
 #include <pcapplusplus/DhcpLayer.h>
 #include <pcapplusplus/EthLayer.h>
 #include <pcapplusplus/IPv4Layer.h>
@@ -22,9 +24,10 @@
 struct event_base *base;
 struct event *ev_sigint;
 struct event *ev_sigterm;
-extern bool feature_dhcp_server_enabled;
+extern std::atomic<bool> feature_dhcp_server_enabled;
 extern std::string global_dhcp_server_ip;
 extern metadata_config m_config;
+extern std::mutex g_shared_config_mutex;
 
 static uint8_t client_recv_buffer[BUFFER_SIZE];
 int config_pipe[2];
@@ -339,13 +342,18 @@ int prepare_vrf_sockets(relay_config &config) {
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(RELAY_PORT);
-        bind(vrf_sock, (struct sockaddr*)&addr, sizeof(addr));
+        if (bind(vrf_sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+            syslog(LOG_ERR, "[DHCPV4_RELAY] bind: Failed to bind vrf socket for %s, error: %s\n",
+                   config.vrf.c_str(), strerror(errno));
+            close(vrf_sock);
+            return -1;
+        }
 
         /* Update the map */
         vrf_sock_map[config.vrf] = {vrf_sock, 1};
     }
 
-    if (vrf_sock > 0) {
+    if (vrf_sock >= 0) {
         config.vrf_sock = vrf_sock;
     } else {
         syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to obtain vrf socket(%s) error:%s \n", config.vrf.c_str(), strerror(errno));
@@ -474,9 +482,20 @@ std::string get_mac_address(const std::string &ifname) {
 }
 
 void encode_relay_option(pcpp::DhcpLayer *dhcp_pkt, relay_config *config) {
-    uint8_t buf[256] = {0};
-    uint8_t buf_offset = 0;
-    std::string bm_mac;
+    /* Max option 82 payload:
+     *   circuit-id TLV : 2 + 253 = 255
+     *   remote-id  TLV : 2 + 17  =  19
+     *   link-sel   TLV : 2 +  4  =   6
+     *   server-ovr TLV : 2 +  4  =   6
+     *   VSS        TLV : 2 + 33  =  35   (1 zero byte + 32-char VRF name)
+     *   total                    = 321
+     */
+    static constexpr size_t OPT82_BUF_SIZE = 321;
+    static constexpr size_t MAX_CIRCUIT_ID_LEN = 253; /* uint8_t TLV length field max */
+    static constexpr size_t MAX_VRF_NAME_LEN = 32;
+
+    uint8_t buf[OPT82_BUF_SIZE] = {0};
+    uint16_t buf_offset = 0;
 
     auto vrf = vlan_vrf_map[config->vlan.c_str()];
 
@@ -486,38 +505,53 @@ void encode_relay_option(pcpp::DhcpLayer *dhcp_pkt, relay_config *config) {
         intf_alias = phy_interface_alias_map[config->phy_interface];
     }
 
+    /* Snapshot shared m_config fields under lock to avoid data race with listener thread */
+    std::string hostname;
+    std::string host_mac_addr;
+    bool is_dualTor;
+    bool is_SmartSwitch;
+    std::string midplane_bridge;
+    {
+        std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+        hostname      = m_config.hostname;
+        host_mac_addr = m_config.host_mac_addr;
+        is_dualTor    = m_config.is_dualTor;
+        is_SmartSwitch   = m_config.is_SmartSwitch;
+        midplane_bridge  = m_config.midplane_bridge;
+    }
+
     /* Encode circuit ID sub-option */
-    /* | 1 | 4 | hostname:interface_alias:vlan | */
+    /* | 1 | len | hostname:interface_alias:vlan | */
     std::string circuit_id;
     if (feature_dhcp_server_enabled) {
-        circuit_id = m_config.hostname + ":" + intf_alias;
+        circuit_id = hostname + ":" + intf_alias;
     } else {
-        circuit_id = m_config.hostname + ":" + intf_alias + ":" + config->vlan;
+        circuit_id = hostname + ":" + intf_alias + ":" + config->vlan;
     }
-    auto offset = encode_tlv(buf, OPTION82_SUBOPT_CIRCUIT_ID, circuit_id.length(),
+    if (circuit_id.length() > MAX_CIRCUIT_ID_LEN) {
+        syslog(LOG_WARNING, "[DHCPV4_RELAY] circuit-id length %zu exceeds max %zu, truncating",
+               circuit_id.length(), MAX_CIRCUIT_ID_LEN);
+        circuit_id.resize(MAX_CIRCUIT_ID_LEN);
+    }
+    auto offset = encode_tlv(buf, OPTION82_SUBOPT_CIRCUIT_ID,
+                             static_cast<uint8_t>(circuit_id.length()),
                              (uint8_t *)circuit_id.c_str());
     buf_offset += offset;
 
-    if (!m_config.midplane_bridge.empty()) {
-        bm_mac = get_mac_address(m_config.midplane_bridge);
-    }
-
     /* Encode remote ID sub-option */
-    /* | 2 | 6 | my_mac| */
-    /* if its SmartSwitch we need to fetch mac of bridge-midplane */
-    if ((m_config.is_SmartSwitch) && (!bm_mac.empty())) {
-        offset = encode_tlv((buf + buf_offset), OPTION82_SUBOPT_REMOTE_ID,
-                            MAC_ADDR_STR_LEN, (uint8_t *)(bm_mac.c_str()));
-        buf_offset += offset;
-    } else {
-        offset = encode_tlv((buf + buf_offset), OPTION82_SUBOPT_REMOTE_ID,
-                            MAC_ADDR_STR_LEN, (uint8_t *)(m_config.host_mac_addr.c_str()));
-        buf_offset += offset;
+    /* | 2 | 17 | mac |
+     * For SmartSwitch fetch the midplane bridge MAC instead of the host MAC. */
+    std::string bm_mac;
+    if (is_SmartSwitch && !midplane_bridge.empty()) {
+        bm_mac = get_mac_address(midplane_bridge);
     }
+    const std::string &remote_id_mac = (is_SmartSwitch && !bm_mac.empty()) ? bm_mac : host_mac_addr;
+    offset = encode_tlv((buf + buf_offset), OPTION82_SUBOPT_REMOTE_ID,
+                        MAC_ADDR_STR_LEN, (uint8_t *)(remote_id_mac.c_str()));
+    buf_offset += offset;
 
-    /* TODO: this sub-option should be set if source interface selection is enabled */
     /* | 5 | 4 | ipv4 | */
-    if (m_config.is_dualTor || config->link_selection_opt == "enable") {
+    if (is_dualTor || config->link_selection_opt == "enable") {
         uint32_t link_sel_ip = ((config->link_address.sin_addr.s_addr) &
                                 (config->link_address_netmask.sin_addr.s_addr));
         offset = encode_tlv((buf + buf_offset), OPTION82_SUBOPT_LINK_SELECTION, sizeof(uint32_t),
@@ -533,17 +567,21 @@ void encode_relay_option(pcpp::DhcpLayer *dhcp_pkt, relay_config *config) {
     }
 
     /* Encode VSS sub-option 151 if client is not default VRF */
-    /* | 151 | vrf_len | 0 | vrf_name | */
-    uint8_t vss_buf[32] = {0};
+    /* | 151 | len | 0 | vrf_name | */
     /* Enable VSS only if client and server are in two different VRF's */
     if ((config->vrf_selection_opt == "enable") && (vrf != "default") &&
         (config->vrf != vrf)) {
-        uint8_t zero_encode = 0;
-        memcpy(vss_buf, &zero_encode, sizeof(uint8_t));
-        memcpy((vss_buf + 1), (uint8_t *)vrf.c_str(), (uint8_t)vrf.length());
+        size_t vrf_name_len = std::min(vrf.length(), MAX_VRF_NAME_LEN);
+        if (vrf.length() > MAX_VRF_NAME_LEN) {
+            syslog(LOG_WARNING, "[DHCPV4_RELAY] VRF name length %zu exceeds max %zu, truncating",
+                   vrf.length(), MAX_VRF_NAME_LEN);
+        }
+        /* vss_buf: 1 zero byte (type indicator) + VRF name */
+        uint8_t vss_buf[MAX_VRF_NAME_LEN + 1] = {0};
+        memcpy((vss_buf + 1), vrf.c_str(), vrf_name_len);
 
         offset = encode_tlv((buf + buf_offset), OPTION82_SUBOPT_VIRTUAL_SUBNET,
-                            (uint8_t)(vrf.length() + 1), vss_buf);
+                            static_cast<uint8_t>(vrf_name_len + 1), vss_buf);
         buf_offset += offset;
     }
 
@@ -626,20 +664,25 @@ void from_client(pcpp::DhcpLayer *dhcp_pkt, relay_config &config) {
     // Backward compatibility for deployment_id 8. If deployment_id is 8, use client interface IP as source IP
     bool use_intf_ip_as_src_ip = false;
     in_addr src_ip = {0};
-    if (m_config.deployment_id == 8) {
+    uint32_t deployment_id;
+    {
+        std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+        deployment_id = m_config.deployment_id;
+    }
+    if (deployment_id == 8) {
         use_intf_ip_as_src_ip = true;
         src_ip.s_addr = config.link_address.sin_addr.s_addr;
     }
 
     for (auto server : config.servers_sock) {
+        const char *server_str = (index < config.servers.size()) ? config.servers[index].c_str() : "<unknown>";
         if (send_udp(sock, (uint8_t *)dhcp_pkt->getDhcpHeader(), server, dhcp_pkt->getHeaderLen(), src_ip, use_intf_ip_as_src_ip, true)) {
             syslog(LOG_INFO, "[DHCPV4_RELAY] DHCP packet is sent to configured server: %s, interface: %s",
-                   config.servers[index].c_str(), config.vlan.c_str());
+                   server_str, config.vlan.c_str());
             dhcp_cntr_table.increment_counter(config.vlan, "TX", (int)dhcp_pkt->getMessageType());
         } else {
             syslog(LOG_NOTICE, "[DHCPV4_RELAY] DHCP packet sending FAILED for configured server: %s, interface: %s",
-                   config.servers[index].c_str(), config.vlan.c_str());
-            // increment drop counter
+                   server_str, config.vlan.c_str());
             dhcp_cntr_table.increment_counter(config.vlan, "TX", DHCPv4_MESSAGE_TYPE_DROP);
         }
         index++;
@@ -702,6 +745,7 @@ void to_client(pcpp::DhcpLayer *dhcp_pkt, std::unordered_map<std::string, relay_
     if (giaddr == 0) {
         syslog(LOG_ERR, "[DHCPV4_RELAY] Message received with empty giaddr from server %s\n",
                src_ip.c_str());
+        freeifaddrs(ifa);
         return;
     }
 
@@ -719,6 +763,7 @@ void to_client(pcpp::DhcpLayer *dhcp_pkt, std::unordered_map<std::string, relay_
                     "[DHCPV4_RELAY] Circuit id sub-option is missing in relay"
                     " agent option from server %s",
                     src_ip.c_str());
+            freeifaddrs(ifa);
             return;
         }
 
@@ -969,9 +1014,17 @@ void pkt_in_callback(evutil_socket_t fd, short event, void *arg) {
             if (vlan == vlan_map.end()) {
                 if (intf.find(CLIENT_IF_PREFIX) != std::string::npos) {
                     syslog(LOG_WARNING, "[DHCPV4_RELAY] Invalid input interface %s\n", interface_name);
-                } else if ((m_config.is_SmartSwitch) && (intf.rfind("dpu", 0) == 0) && !m_config.midplane_bridge.empty()) {
-                    // if its SmartSwitch, we need to check for bridge_midplane interface
-                    vlan_str = m_config.midplane_bridge;
+                } else {
+                    bool is_ss;
+                    std::string mp_bridge;
+                    {
+                        std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                        is_ss = m_config.is_SmartSwitch;
+                        mp_bridge = m_config.midplane_bridge;
+                    }
+                    if (is_ss && (intf.rfind("dpu", 0) == 0) && !mp_bridge.empty()) {
+                        vlan_str = mp_bridge;
+                    }
                 }
             } else {
                 vlan_str = vlan->second;
@@ -979,6 +1032,7 @@ void pkt_in_callback(evutil_socket_t fd, short event, void *arg) {
         } else {
             vlan_str = "Vlan" + std::to_string(vlan_id);
         }
+
 
         gettimeofday(&time, nullptr);
 
@@ -1228,6 +1282,7 @@ void config_event_callback(evutil_socket_t fd, short event, void *arg) {
                         update_vlan_mapping(relay_msg->vlan, true);
                         if (prepare_vlan_sockets((*vlans)[relay_msg->vlan]) == -1) {
                             syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to create Vlan listen socket");
+                            delete relay_msg;
                             return;
                         }
                         /* Intially filling the vlan interface IP address. */
@@ -1305,6 +1360,7 @@ void config_event_callback(evutil_socket_t fd, short event, void *arg) {
                    update_interface_vlan_mapping(msg->interface, msg->vlan, msg->is_add);
                    if (prepare_vlan_sockets((*vlans)[msg->vlan]) == -1) {
                        syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to create Vlan listen socket");
+                       delete msg;
                        return;
                    }
                    delete msg;
@@ -1326,6 +1382,7 @@ void config_event_callback(evutil_socket_t fd, short event, void *arg) {
                       }
                       if (prepare_vlan_sockets((*vlans)[msg->vlan]) == -1) {
                           syslog(LOG_ERR, "[DHCPV4_RELAY] Failed to create Vlan listen socket");
+                          delete msg;
                           return;
                       }
 		      prepare_relay_interface_config((*vlans)[msg->vlan]);
@@ -1336,6 +1393,7 @@ void config_event_callback(evutil_socket_t fd, short event, void *arg) {
                                                                     "DHCPV4_RELAY");
                    dhcp_relay_tbl->hget((msg->vlan), "server_vrf", value);
                    if ((msg->vrf.empty()) || (value.length() != 0)) {
+                       delete msg;
                        return;
                    }
 
@@ -1352,11 +1410,16 @@ void config_event_callback(evutil_socket_t fd, short event, void *arg) {
                    delete_all_relay_configs(vlans);
         } else if (received_event.type == DHCPv4_SERVER_IP_UPDATE) {
                 syslog(LOG_INFO, "[DHCPV4_RELAY]  dhcp_server IP update in state DB event received");
+                std::string server_ip;
+                {
+                    std::lock_guard<std::mutex> lock(g_shared_config_mutex);
+                    server_ip = global_dhcp_server_ip;
+                }
                 for (auto it = vlans->begin(); it != vlans->end(); ++it) {
                      relay_config &config = it->second;
                      config.servers.clear();
                      config.servers_sock.clear();
-                     config.servers.push_back(global_dhcp_server_ip);
+                     config.servers.push_back(server_ip);
                      prepare_relay_server_config(config);
                 }
         } else if (received_event.type == DHCPv4_RELAY_DUAL_TOR_UPDATE) {
